@@ -24,6 +24,9 @@ extern "C" {
 #include <utility>
 #include <vector>
 
+
+#define PKT_SIZE (1024 - 32) / 8 // payload has 32 bytes already
+
 namespace {
 
 using namespace std::chrono;
@@ -118,6 +121,7 @@ struct payload {
   uint64_t index;
   uint64_t tsc_end;
   uint32_t cpu;
+  uint64_t pad[PKT_SIZE];
 };
 
 // The maximum lateness to tolerate before dropping egress samples.
@@ -177,11 +181,69 @@ struct work_unit {
 template <class Arrival, class Service>
 std::vector<work_unit> GenerateWork(Arrival a, Service s, double cur_us,
                                     double last_us) {
+  std::random_device eng;
   std::vector<work_unit> w;
   while (cur_us < last_us) {
     cur_us += a();
     w.emplace_back(work_unit{cur_us, s(), 0});
   }
+  return w;
+}
+
+std::vector<work_unit> ClosedLoopClientWorker(
+    rt::TcpConn *c, rt::WaitGroup *starter,
+    std::function<std::vector<work_unit>()> wf) {
+  std::vector<work_unit> w(wf());
+  std::vector<time_point<steady_clock>> timings;
+  timings.reserve(w.size());
+
+  //std::cout << "Sending " << w.size() << " packets of size " << sizeof(payload) << std::endl;
+  // Synchronized start of load generation.
+  starter->Done();
+  starter->Wait();
+
+  payload p;
+  auto wsize = w.size();
+
+  for (unsigned int i = 0; i < wsize; ++i) {
+    barrier();
+    timings[i] = steady_clock::now();
+    barrier();
+
+    // Enqueue a network request.
+    p.work_iterations = 0;
+    p.index = hton64(i);
+
+    // Send
+    ssize_t ret = c->WriteFull(&p, sizeof(payload));
+    if (ret != static_cast<ssize_t>(sizeof(payload)))
+      panic("write failed, ret = %ld", ret);
+
+    //std::cout << "sent a packet" << std::endl;
+
+    // Receive
+    payload rp;
+    ret = c->ReadFull(&rp, sizeof(rp));
+    if (ret != static_cast<ssize_t>(sizeof(rp))) {
+      if (ret == 0 || ret < 0) break;
+      panic("read failed, ret = %ld", ret);
+    }
+
+    //std::cout << "received it back" << std::endl;
+
+    barrier();
+    auto ts = steady_clock::now();
+    barrier();
+    uint64_t idx = ntoh64(rp.index);
+    w[idx].duration_us = duration_cast<sec>(ts - timings[idx]).count();
+    w[idx].tsc = ntoh64(rp.tsc_end);
+    w[idx].cpu = ntoh32(rp.cpu);
+
+  }
+
+  // rt::Sleep(1 * rt::kSeconds);
+  c->Shutdown(SHUT_RDWR);
+
   return w;
 }
 
@@ -271,6 +333,7 @@ std::vector<work_unit> RunExperiment(
     std::function<std::vector<work_unit>()> wf) {
   // Create one TCP connection per thread.
   std::vector<std::unique_ptr<rt::TcpConn>> conns;
+  //log_info("Starting %d client threads", threads);
   for (int i = 0; i < threads; ++i) {
     std::unique_ptr<rt::TcpConn> outc(rt::TcpConn::Dial({0, 0}, raddr));
     if (unlikely(outc == nullptr)) panic("couldn't connect to raddr.");
@@ -283,7 +346,8 @@ std::vector<work_unit> RunExperiment(
   std::unique_ptr<std::vector<work_unit>> samples[threads];
   for (int i = 0; i < threads; ++i) {
     th.emplace_back(rt::Thread([&, i] {
-      auto v = ClientWorker(conns[i].get(), &starter, wf);
+      //auto v = ClientWorker(conns[i].get(), &starter, wf);
+      auto v = ClosedLoopClientWorker(conns[i].get(), &starter, wf);
       samples[i].reset(new std::vector<work_unit>(std::move(v)));
     }));
   }
@@ -317,11 +381,13 @@ std::vector<work_unit> RunExperiment(
     w.insert(w.end(), v.begin(), v.end());
   }
 
+  log_info("Tried to send : %lu", w.size());
   // Remove requests that did not complete.
   w.erase(std::remove_if(w.begin(), w.end(),
                          [](const work_unit &s) { return s.duration_us == 0; }),
           w.end());
 
+  log_info("Successful requests: %d", w.size());
   // Report results.
   double elapsed = duration_cast<sec>(finish - start).count();
   if (reqs_per_sec != nullptr)
@@ -359,10 +425,11 @@ void PrintStatResults(std::vector<work_unit> w, double offered_rps, double rps,
   double p9999 = w[count * 0.9999].duration_us;
   double min = w[0].duration_us;
   double max = w[w.size() - 1].duration_us;
-  std::cout  //<<
+  std::cout  <<
              //"#threads,offered_rps,rps,cpu_usage,samples,min,mean,p90,p99,p999,p9999,max"
-             //<< std::endl
-      << std::setprecision(4) << std::fixed << threads << "," << offered_rps
+             "#threads,rps,cpu_usage,samples,min,mean,p90,p99,p999,p9999,max"
+             << std::endl
+      << std::setprecision(4) << std::fixed << threads
       << "," << rps << "," << cpu_usage << "," << w.size() << "," << min << ","
       << mean << "," << p90 << "," << p99 << "," << p999 << "," << p9999 << ","
       << max << std::endl;
@@ -409,7 +476,7 @@ void LoadShiftExperiment(int threads,
 void ClientHandler(void *arg) {
   // LoadShiftExperiment(threads, rates, st);
 #if 1
-  for (double i = 50000; i <= 8000000; i += 50000) {
+  for (double i = 50000; i <= 500000; i += 50000) {
     SteadyStateExperiment(threads, i, st);
   }
 #endif
